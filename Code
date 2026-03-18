@@ -1,0 +1,452 @@
+-- =========================================================
+-- 1. DATABASE & SCHEMAS
+-- =========================================================
+CREATE DATABASE IF NOT EXISTS EV_DB;
+USE DATABASE EV_DB;
+
+CREATE SCHEMA IF NOT EXISTS RAW;
+CREATE SCHEMA IF NOT EXISTS VALIDATED;
+CREATE SCHEMA IF NOT EXISTS CURATED;
+CREATE SCHEMA IF NOT EXISTS LOGS;
+
+-- =========================================================
+-- 2. FILE FORMAT
+-- =========================================================
+CREATE OR REPLACE FILE FORMAT EV_CSV_FORMAT
+TYPE = 'CSV'
+SKIP_HEADER = 1
+FIELD_OPTIONALLY_ENCLOSED_BY = '"';
+
+-- =========================================================
+-- 3. STAGE (UNCHANGED AS REQUESTED)
+-- =========================================================
+CREATE OR REPLACE STAGE EV_S3_STAGE
+URL = 's3://evcharge123/EV_CHARGING/'
+CREDENTIALS = (
+  AWS_KEY_ID = 'AKIA5QFYTKL6UHA6D3U3'
+  AWS_SECRET_KEY = 'q4kUIzdzMPE7g6bL1VehmOqzvQbMPNpAhIBqRoYc'
+)
+FILE_FORMAT = EV_CSV_FORMAT;
+
+-- =========================================================
+-- 4. RAW TABLES
+-- =========================================================
+CREATE OR REPLACE TABLE RAW.STATIONS_RAW (
+    station_id STRING, station_name STRING, latitude FLOAT, longitude FLOAT,
+    city STRING, zone STRING, capacity_kw FLOAT, operator STRING,
+    status STRING, install_date DATE
+);
+
+CREATE OR REPLACE TABLE RAW.CHARGERS_RAW (
+    charger_id STRING, station_id STRING, charger_type STRING,
+    max_kw FLOAT, status STRING, firmware_version STRING,
+    last_maintenance_date DATE, error_code STRING
+);
+
+CREATE OR REPLACE TABLE RAW.SESSIONS_RAW (
+    session_id STRING, user_id STRING, vehicle_id STRING, charger_id STRING,
+    start_time TIMESTAMP, end_time TIMESTAMP, energy_kwh FLOAT,
+    duration_sec NUMBER, tariff_type STRING, price FLOAT,
+    start_soc NUMBER, end_soc NUMBER, grid_meter_reading FLOAT,
+    payment_channel STRING, is_flagged STRING
+);
+
+CREATE OR REPLACE TABLE RAW.USERS_RAW (
+    user_id STRING, name STRING, dob DATE, gender STRING,
+    phone STRING, email STRING, city STRING, state STRING,
+    registration_date DATE, kyc_status STRING,
+    is_fleet_user STRING, corporate_id STRING
+);
+
+CREATE OR REPLACE TABLE RAW.VEHICLES_RAW (
+    vehicle_id STRING, user_id STRING, model STRING,
+    battery_capacity_kwh FLOAT, vin STRING, registration_number STRING
+);
+
+-- =========================================================
+-- 5. LOAD DATA (FIXED PATHS)
+-- =========================================================
+LIST @EV_S3_STAGE;
+
+COPY INTO RAW.CHARGERS_RAW
+FROM @EV_S3_STAGE/EV_CHARGING/chargers_master.csv;
+
+COPY INTO RAW.STATIONS_RAW 
+FROM @EV_S3_STAGE/EV_CHARGING/ev_stations_master.csv;
+
+COPY INTO RAW.SESSIONS_RAW 
+FROM @EV_S3_STAGE/EV_CHARGING/sessions_master.csv;
+
+COPY INTO RAW.USERS_RAW 
+FROM @EV_S3_STAGE/EV_CHARGING/users_master.csv;
+
+COPY INTO RAW.VEHICLES_RAW 
+FROM @EV_S3_STAGE/EV_CHARGING/vehicles_master.csv;
+
+-- Incremental Loads (ADD THIS BLOCK)
+COPY INTO RAW.CHARGERS_RAW
+FROM @EV_S3_STAGE/EV_CHARGING/chargers_inc.csv;
+
+COPY INTO RAW.STATIONS_RAW 
+FROM @EV_S3_STAGE/EV_CHARGING/ev_stations_inc.csv;
+
+COPY INTO RAW.SESSIONS_RAW 
+FROM @EV_S3_STAGE/EV_CHARGING/sessions_inc.csv;
+
+COPY INTO RAW.USERS_RAW 
+FROM @EV_S3_STAGE/EV_CHARGING/users_inc.csv;
+
+COPY INTO RAW.VEHICLES_RAW 
+FROM @EV_S3_STAGE/EV_CHARGING/vehicles_inc.csv;
+
+
+-- =========================================================
+-- 6. STREAMS
+-- =========================================================
+CREATE OR REPLACE STREAM RAW.SESSIONS_STREAM ON TABLE RAW.SESSIONS_RAW;
+CREATE OR REPLACE STREAM RAW.CHARGERS_STREAM ON TABLE RAW.CHARGERS_RAW;
+CREATE OR REPLACE STREAM RAW.STATIONS_STREAM ON TABLE RAW.STATIONS_RAW;
+
+-- =========================================================
+-- 7. VALIDATED LAYER
+-- =========================================================
+
+CREATE OR REPLACE TABLE VALIDATED.SESSIONS AS
+SELECT *,
+    CONVERT_TIMEZONE('UTC', start_time) AS start_time_utc,
+    CONVERT_TIMEZONE('UTC', end_time) AS end_time_utc,
+    TO_BOOLEAN(is_flagged) AS is_flagged_bool
+FROM RAW.SESSIONS_RAW;
+
+CREATE OR REPLACE TABLE VALIDATED.SESSIONS_CLEAN AS
+SELECT *
+FROM VALIDATED.SESSIONS
+WHERE energy_kwh >= 0
+  AND duration_sec >= 0
+  AND start_soc BETWEEN 0 AND 100
+  AND end_soc BETWEEN 0 AND 100
+  AND end_time_utc >= start_time_utc;
+
+CREATE OR REPLACE TABLE VALIDATED.SESSIONS_DEDUP AS
+SELECT *
+FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY start_time_utc DESC) rn
+    FROM VALIDATED.SESSIONS_CLEAN
+)
+WHERE rn = 1;
+
+CREATE OR REPLACE TABLE VALIDATED.SESSIONS_FINAL AS
+SELECT s.*
+FROM VALIDATED.SESSIONS_DEDUP s
+JOIN RAW.CHARGERS_RAW c ON s.charger_id = c.charger_id
+JOIN RAW.USERS_RAW u ON s.user_id = u.user_id;
+
+CREATE OR REPLACE TABLE VALIDATED.STATIONS AS
+SELECT * FROM RAW.STATIONS_RAW WHERE capacity_kw >= 0;
+
+CREATE OR REPLACE TABLE VALIDATED.CHARGERS AS
+SELECT * FROM RAW.CHARGERS_RAW WHERE max_kw > 0;
+
+CREATE OR REPLACE TABLE VALIDATED.USERS AS
+SELECT * FROM RAW.USERS_RAW;
+
+CREATE OR REPLACE TABLE VALIDATED.VEHICLES AS
+SELECT * FROM RAW.VEHICLES_RAW;
+
+-- =========================================================
+-- 8. CURATED LAYER (FIXED SCD-2)
+-- =========================================================
+
+
+CREATE OR REPLACE TABLE CURATED.DIM_STATIONS (
+    station_id STRING,
+    station_name STRING,
+    city STRING,
+    zone STRING,
+    capacity_kw FLOAT,
+    status STRING,
+    start_date DATE,
+    end_date DATE,
+    is_current BOOLEAN
+);
+
+-- STEP 1: CLOSE OLD RECORDS
+UPDATE CURATED.DIM_STATIONS tgt
+SET end_date = CURRENT_DATE(),
+    is_current = FALSE
+FROM VALIDATED.STATIONS src
+WHERE tgt.station_id = src.station_id
+  AND tgt.is_current = TRUE
+  AND (
+      tgt.capacity_kw != src.capacity_kw
+      OR tgt.status != src.status
+  );
+
+-- STEP 2: INSERT NEW RECORDS (NEW + CHANGED)
+INSERT INTO CURATED.DIM_STATIONS
+SELECT 
+    src.station_id,
+    src.station_name,
+    src.city,
+    src.zone,
+    src.capacity_kw,
+    src.status,
+    CURRENT_DATE() AS start_date,
+    NULL AS end_date,
+    TRUE AS is_current
+FROM VALIDATED.STATIONS src
+LEFT JOIN CURATED.DIM_STATIONS tgt
+    ON src.station_id = tgt.station_id
+    AND tgt.is_current = TRUE
+WHERE tgt.station_id IS NULL
+   OR (
+       tgt.capacity_kw != src.capacity_kw
+       OR tgt.status != src.status
+   );
+
+-- =========================================================
+-- OTHER DIMENSIONS
+-- =========================================================
+CREATE OR REPLACE TABLE CURATED.DIM_USERS AS 
+SELECT * FROM VALIDATED.USERS;
+
+CREATE OR REPLACE TABLE CURATED.DIM_CHARGERS AS 
+SELECT * FROM VALIDATED.CHARGERS;
+
+CREATE OR REPLACE TABLE CURATED.DIM_VEHICLES AS 
+SELECT * FROM VALIDATED.VEHICLES;
+
+-- =========================================================
+-- FACT TABLE
+-- =========================================================
+CREATE OR REPLACE TABLE CURATED.FACT_SESSIONS AS
+SELECT 
+    session_id,
+    user_id,
+    vehicle_id,
+    charger_id,
+    energy_kwh,
+    duration_sec,
+    price,
+    tariff_type,
+    start_time_utc,
+    end_time_utc
+FROM VALIDATED.SESSIONS_FINAL;
+
+-- =========================================================
+-- 9. INCREMENTAL LOAD (FIXED STREAM USAGE)
+-- =========================================================
+CREATE OR REPLACE PROCEDURE LOAD_SESSIONS_INCREMENTAL()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+
+MERGE INTO RAW.SESSIONS_RAW tgt
+USING (
+    SELECT * FROM RAW.SESSIONS_STREAM
+    WHERE METADATA$ACTION = 'INSERT'
+) src
+ON tgt.session_id = src.session_id
+
+WHEN MATCHED THEN UPDATE SET 
+    energy_kwh = src.energy_kwh,
+    duration_sec = src.duration_sec
+
+WHEN NOT MATCHED THEN INSERT VALUES (
+    src.session_id, src.user_id, src.vehicle_id, src.charger_id,
+    src.start_time, src.end_time, src.energy_kwh,
+    src.duration_sec, src.tariff_type, src.price,
+    src.start_soc, src.end_soc, src.grid_meter_reading,
+    src.payment_channel, src.is_flagged
+);
+
+RETURN 'Incremental Load Completed';
+
+END;
+$$;
+
+-- =========================================================
+-- 10. ADVANCED ANOMALY DETECTION
+-- =========================================================
+CREATE OR REPLACE TABLE CURATED.ANOMALIES AS
+SELECT s.*,
+CASE 
+    WHEN (end_soc - start_soc) > 30 AND duration_sec < 120 THEN 'SOC_JUMP'
+    WHEN duration_sec = 0 THEN 'INVALID_SESSION'
+    WHEN energy_kwh > 150 THEN 'ENERGY_ANOMALY'
+    WHEN EXISTS (
+        SELECT 1 FROM VALIDATED.SESSIONS_FINAL s2
+        WHERE s.user_id = s2.user_id
+        AND s.session_id <> s2.session_id
+        AND s.start_time_utc < s2.end_time_utc
+        AND s.end_time_utc > s2.start_time_utc
+    ) THEN 'PARALLEL_SESSION'
+END AS anomaly_type
+FROM VALIDATED.SESSIONS_FINAL s;
+
+-- =========================================================
+-- 11. LOGGING & AUDIT
+-- =========================================================
+CREATE OR REPLACE TABLE LOGS.PIPELINE_LOGS (
+    log_time TIMESTAMP,
+    table_name STRING,
+    record_count NUMBER
+);
+
+INSERT INTO LOGS.PIPELINE_LOGS
+SELECT CURRENT_TIMESTAMP, 'FACT_SESSIONS', COUNT(*)
+FROM CURATED.FACT_SESSIONS;
+
+-- =========================================================
+-- 12. TASK (FIXED USING PROCEDURE WRAPPER)
+-- =========================================================
+
+
+CREATE OR REPLACE PROCEDURE RUN_PIPELINE()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+
+  -- STEP 1: INCREMENTAL LOAD
+  CALL LOAD_SESSIONS_INCREMENTAL();
+
+  -- STEP 2: REFRESH VALIDATED LAYER
+  CREATE OR REPLACE TABLE VALIDATED.SESSIONS AS
+  SELECT *,
+      CONVERT_TIMEZONE('UTC', start_time) AS start_time_utc,
+      CONVERT_TIMEZONE('UTC', end_time) AS end_time_utc,
+      TO_BOOLEAN(is_flagged) AS is_flagged_bool
+  FROM RAW.SESSIONS_RAW;
+
+  -- STEP 3: DATA QUALITY FILTER
+  CREATE OR REPLACE TABLE VALIDATED.SESSIONS_CLEAN AS
+  SELECT *
+  FROM VALIDATED.SESSIONS
+  WHERE energy_kwh >= 0
+    AND duration_sec >= 0
+    AND start_soc BETWEEN 0 AND 100
+    AND end_soc BETWEEN 0 AND 100
+    AND end_time_utc >= start_time_utc;
+
+  -- STEP 4: DEDUP
+  CREATE OR REPLACE TABLE VALIDATED.SESSIONS_DEDUP AS
+  SELECT *
+  FROM (
+      SELECT *,
+             ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY start_time_utc DESC) rn
+      FROM VALIDATED.SESSIONS_CLEAN
+  )
+  WHERE rn = 1;
+
+  -- STEP 5: FINAL VALIDATED
+  CREATE OR REPLACE TABLE VALIDATED.SESSIONS_FINAL AS
+  SELECT s.*
+  FROM VALIDATED.SESSIONS_DEDUP s
+  JOIN RAW.CHARGERS_RAW c ON s.charger_id = c.charger_id
+  JOIN RAW.USERS_RAW u ON s.user_id = u.user_id;
+
+  -- STEP 6: REFRESH FACT TABLE
+  CREATE OR REPLACE TABLE CURATED.FACT_SESSIONS AS
+  SELECT 
+      session_id,
+      user_id,
+      vehicle_id,
+      charger_id,
+      energy_kwh,
+      duration_sec,
+      price,
+      tariff_type,
+      start_time_utc,
+      end_time_utc
+  FROM VALIDATED.SESSIONS_FINAL;
+
+  -- STEP 7: LOGGING
+  INSERT INTO LOGS.PIPELINE_LOGS
+  SELECT CURRENT_TIMESTAMP, 'FACT_SESSIONS', COUNT(*) 
+  FROM CURATED.FACT_SESSIONS;
+
+  RETURN 'PIPELINE SUCCESS';
+
+END;
+$$;
+
+-- TASK
+CREATE OR REPLACE TASK EV_PIPELINE_TASK
+WAREHOUSE = COMPUTE_WH
+SCHEDULE = '5 MINUTE'
+AS
+CALL RUN_PIPELINE();
+
+ALTER TASK EV_PIPELINE_TASK RESUME;
+
+-- =========================================================
+-- 13. SECURITY (UNCHANGED)
+-- =========================================================
+CREATE OR REPLACE MASKING POLICY MASK_EMAIL
+AS (val STRING) RETURNS STRING ->
+CASE WHEN CURRENT_ROLE() = 'ACCOUNTADMIN' THEN val ELSE 'XXXX@masked.com' END;
+
+ALTER TABLE CURATED.DIM_USERS MODIFY COLUMN email SET MASKING POLICY MASK_EMAIL;
+
+CREATE OR REPLACE MASKING POLICY MASK_PHONE
+AS (val STRING) RETURNS STRING ->
+CASE 
+    WHEN CURRENT_ROLE() IN ('ACCOUNTADMIN') THEN val
+    WHEN val IS NULL THEN NULL
+    ELSE CONCAT('XXXXXX', RIGHT(val, 4))
+END;
+
+ALTER TABLE CURATED.DIM_USERS
+MODIFY COLUMN phone
+SET MASKING POLICY MASK_PHONE;
+
+CREATE OR REPLACE MASKING POLICY MASK_VIN
+AS (val STRING) RETURNS STRING ->
+CASE 
+    WHEN CURRENT_ROLE() IN ('ACCOUNTADMIN') THEN val
+    WHEN val IS NULL THEN NULL
+    ELSE CONCAT(LEFT(val, 3), 'XXXXXXX', RIGHT(val, 2))
+END;
+
+ALTER TABLE CURATED.DIM_VEHICLES
+MODIFY COLUMN vin
+SET MASKING POLICY MASK_VIN;
+
+CREATE OR REPLACE ROW ACCESS POLICY REGION_POLICY
+AS (city STRING) RETURNS BOOLEAN ->
+CURRENT_ROLE() = 'ACCOUNTADMIN';
+
+ALTER TABLE CURATED.DIM_STATIONS
+ADD ROW ACCESS POLICY REGION_POLICY ON (city);
+
+-- =========================================================
+-- 14. FINAL KPIs
+-- =========================================================
+
+SELECT COUNT(*) * 100.0 / (SELECT COUNT(*) FROM CURATED.FACT_SESSIONS)
+FROM CURATED.ANOMALIES;
+
+SELECT charger_id,
+COUNT(CASE WHEN status IN ('Available','Charging') THEN 1 END) * 100.0 / COUNT(*) AS uptime
+FROM CURATED.DIM_CHARGERS
+GROUP BY charger_id;
+
+SELECT COUNT(DISTINCT user_id) * 100.0 /
+(SELECT COUNT(*) FROM CURATED.DIM_USERS)
+FROM CURATED.FACT_SESSIONS
+WHERE start_time_utc >= DATEADD(day, -30, CURRENT_DATE());
+
+SELECT st.city,
+COUNT(CASE WHEN f.energy_kwh < 50 THEN 1 END)*100.0/COUNT(*) AS balanced_load_pct
+FROM CURATED.FACT_SESSIONS f
+JOIN CURATED.DIM_CHARGERS c ON f.charger_id = c.charger_id
+JOIN CURATED.DIM_STATIONS st ON c.station_id = st.station_id
+GROUP BY st.city;
+
+SELECT tariff_type, AVG(price)
+FROM CURATED.FACT_SESSIONS
+GROUP BY tariff_type;
